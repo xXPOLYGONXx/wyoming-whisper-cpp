@@ -3,29 +3,31 @@
 
 #include "common-sdl.h"
 #include "common.h"
+#include "common-whisper.h"
 #include "whisper.h"
 #include "llama.h"
 
-#include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <regex>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
-#include <regex>
-#include <sstream>
 
-std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
-    auto * model = llama_get_model(ctx);
+static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // upper limit for the number of tokens
     int n_tokens = text.length() + add_bos;
     std::vector<llama_token> result(n_tokens);
-    n_tokens = llama_tokenize(model, text.data(), text.length(), result.data(), result.size(), add_bos, false);
+    n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_bos, false);
     if (n_tokens < 0) {
         result.resize(-n_tokens);
-        int check = llama_tokenize(model, text.data(), text.length(), result.data(), result.size(), add_bos, false);
+        int check = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_bos, false);
         GGML_ASSERT(check == -n_tokens);
     } else {
         result.resize(n_tokens);
@@ -33,12 +35,15 @@ std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::s
     return result;
 }
 
-std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token) {
+static std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
     std::vector<char> result(8, 0);
-    const int n_tokens = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size());
+    const int n_tokens = llama_token_to_piece(vocab, token, result.data(), result.size(), 0, false);
     if (n_tokens < 0) {
         result.resize(-n_tokens);
-        int check = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size());
+        int check = llama_token_to_piece(vocab, token, result.data(), result.size(), 0, false);
         GGML_ASSERT(check == -n_tokens);
     } else {
         result.resize(n_tokens);
@@ -55,17 +60,23 @@ struct whisper_params {
     int32_t max_tokens = 32;
     int32_t audio_ctx  = 0;
     int32_t n_gpu_layers = 999;
-
+    int32_t seed = 0;
+    int32_t top_k = 5;
+    int32_t min_keep = 1;
+    float top_p = 0.80f;
+    float min_p = 0.01f;
+    float temp  = 0.30f;
+    
     float vad_thold  = 0.6f;
     float freq_thold = 100.0f;
 
-    bool speed_up       = false;
     bool translate      = false;
     bool print_special  = false;
     bool print_energy   = false;
     bool no_timestamps  = true;
     bool verbose_prompt = false;
     bool use_gpu        = true;
+    bool flash_attn     = false;
 
     std::string person      = "Georgi";
     std::string bot_name    = "LLaMA";
@@ -83,7 +94,7 @@ struct whisper_params {
 
 void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
 
-bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
+static bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
 
@@ -97,14 +108,20 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
         else if (arg == "-mt"  || arg == "--max-tokens")     { params.max_tokens     = std::stoi(argv[++i]); }
         else if (arg == "-ac"  || arg == "--audio-ctx")      { params.audio_ctx      = std::stoi(argv[++i]); }
         else if (arg == "-ngl" || arg == "--n-gpu-layers")   { params.n_gpu_layers   = std::stoi(argv[++i]); }
+        else if (arg == "--seed")                            { params.seed           = std::stoi(argv[++i]); }
+        else if (arg == "--top-k")                           { params.top_k          = std::stoi(argv[++i]); }
+        else if (arg == "--min-keep")                        { params.min_keep       = std::stoul(argv[++i]);}
+        else if (arg == "--top-p")                           { params.top_p          = std::stof(argv[++i]); }
+        else if (arg == "--min-p")                           { params.min_p          = std::stof(argv[++i]); }
+        else if (arg == "--temp")                            { params.temp           = std::stof(argv[++i]); }
         else if (arg == "-vth" || arg == "--vad-thold")      { params.vad_thold      = std::stof(argv[++i]); }
         else if (arg == "-fth" || arg == "--freq-thold")     { params.freq_thold     = std::stof(argv[++i]); }
-        else if (arg == "-su"  || arg == "--speed-up")       { params.speed_up       = true; }
         else if (arg == "-tr"  || arg == "--translate")      { params.translate      = true; }
         else if (arg == "-ps"  || arg == "--print-special")  { params.print_special  = true; }
         else if (arg == "-pe"  || arg == "--print-energy")   { params.print_energy   = true; }
         else if (arg == "-vp"  || arg == "--verbose-prompt") { params.verbose_prompt = true; }
         else if (arg == "-ng"  || arg == "--no-gpu")         { params.use_gpu        = false; }
+        else if (arg == "-fa"  || arg == "--flash-attn")     { params.flash_attn     = true; }
         else if (arg == "-p"   || arg == "--person")         { params.person         = argv[++i]; }
         else if (arg == "-bn"   || arg == "--bot-name")      { params.bot_name       = argv[++i]; }
         else if (arg == "--session")                         { params.path_session   = argv[++i]; }
@@ -123,7 +140,6 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
             }
         }
         else if (arg == "-f"   || arg == "--file")          { params.fname_out     = argv[++i]; }
-        else if (arg == "-ng"  || arg == "--no-gpu")        { params.use_gpu       = false; }
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             whisper_print_usage(argc, argv, params);
@@ -146,14 +162,20 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -mt N,    --max-tokens N   [%-7d] maximum number of tokens per audio chunk\n",    params.max_tokens);
     fprintf(stderr, "  -ac N,    --audio-ctx N    [%-7d] audio context size (0 - all)\n",                params.audio_ctx);
     fprintf(stderr, "  -ngl N,   --n-gpu-layers N [%-7d] number of layers to store in VRAM\n",           params.n_gpu_layers);
+    fprintf(stderr, "  --seed N                   [%-7d] seed sampling\n",                               params.seed);
+    fprintf(stderr, "  --top-k N                  [%-7d] top-k sampling (0 = disabled)\n",               params.top_k);
+    fprintf(stderr, "  --min-keep N               [%-7d] minimum number of tokens to keep\n",            params.min_keep);
+    fprintf(stderr, "  --top-p N                  [%-7.2f] top-p sampling\n",                            params.top_p);
+    fprintf(stderr, "  --min-p N                  [%-7.2f] min-p sampling\n",                            params.min_p);
+    fprintf(stderr, "  --temp N                   [%-7.2f] temperature\n",                               params.temp);
     fprintf(stderr, "  -vth N,   --vad-thold N    [%-7.2f] voice activity detection threshold\n",        params.vad_thold);
     fprintf(stderr, "  -fth N,   --freq-thold N   [%-7.2f] high-pass frequency cutoff\n",                params.freq_thold);
-    fprintf(stderr, "  -su,      --speed-up       [%-7s] speed up audio by x2 (reduced accuracy)\n",     params.speed_up ? "true" : "false");
     fprintf(stderr, "  -tr,      --translate      [%-7s] translate from source language to english\n",   params.translate ? "true" : "false");
     fprintf(stderr, "  -ps,      --print-special  [%-7s] print special tokens\n",                        params.print_special ? "true" : "false");
     fprintf(stderr, "  -pe,      --print-energy   [%-7s] print sound energy (for debugging)\n",          params.print_energy ? "true" : "false");
     fprintf(stderr, "  -vp,      --verbose-prompt [%-7s] print prompt at start\n",                       params.verbose_prompt ? "true" : "false");
     fprintf(stderr, "  -ng,      --no-gpu         [%-7s] disable GPU\n",                                 params.use_gpu ? "false" : "true");
+    fprintf(stderr, "  -fa,      --flash-attn     [%-7s] flash attention\n",                             params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -p NAME,  --person NAME    [%-7s] person name (for prompt selection)\n",          params.person.c_str());
     fprintf(stderr, "  -bn NAME, --bot-name NAME  [%-7s] bot name (to display)\n",                       params.bot_name.c_str());
     fprintf(stderr, "  -w TEXT,  --wake-command T [%-7s] wake-up command to listen for\n",               params.wake_cmd.c_str());
@@ -169,7 +191,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "\n");
 }
 
-std::string transcribe(
+static std::string transcribe(
         whisper_context * ctx,
         const whisper_params & params,
         const std::vector<float> & pcmf32,
@@ -203,7 +225,6 @@ std::string transcribe(
     wparams.prompt_n_tokens  = prompt_tokens.empty() ? 0       : prompt_tokens.size();
 
     wparams.audio_ctx        = params.audio_ctx;
-    wparams.speed_up         = params.speed_up;
 
     if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
         return "";
@@ -237,7 +258,7 @@ std::string transcribe(
     return result;
 }
 
-std::vector<std::string> get_words(const std::string &txt) {
+static std::vector<std::string> get_words(const std::string &txt) {
     std::vector<std::string> words;
 
     std::istringstream iss(txt);
@@ -270,6 +291,8 @@ The transcript only includes text, it does not include markup like HTML and Mark
 {0}{4})";
 
 int main(int argc, char ** argv) {
+    ggml_backend_load_all();
+
     whisper_params params;
 
     if (whisper_params_parse(argc, argv, params) == false) {
@@ -285,9 +308,15 @@ int main(int argc, char ** argv) {
     // whisper init
 
     struct whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu = params.use_gpu;
+
+    cparams.use_gpu    = params.use_gpu;
+    cparams.flash_attn = params.flash_attn;
 
     struct whisper_context * ctx_wsp = whisper_init_from_file_with_params(params.model_wsp.c_str(), cparams);
+    if (!ctx_wsp) {
+        fprintf(stderr, "No whisper.cpp model specified. Please provide using -mw <modelfile>\n");
+        return 1;
+    }
 
     // llama init
 
@@ -300,16 +329,22 @@ int main(int argc, char ** argv) {
         lmparams.n_gpu_layers = params.n_gpu_layers;
     }
 
-    struct llama_model * model_llama = llama_load_model_from_file(params.model_llama.c_str(), lmparams);
+    struct llama_model * model_llama = llama_model_load_from_file(params.model_llama.c_str(), lmparams);
+    if (!model_llama) {
+        fprintf(stderr, "No llama.cpp model specified. Please provide using -ml <modelfile>\n");
+        return 1;
+    }
+
+    const llama_vocab * vocab_llama = llama_model_get_vocab(model_llama);
 
     llama_context_params lcparams = llama_context_default_params();
 
     // tune these to your liking
     lcparams.n_ctx      = 2048;
-    lcparams.seed       = 1;
     lcparams.n_threads  = params.n_threads;
+    lcparams.flash_attn = params.flash_attn;
 
-    struct llama_context * ctx_llama = llama_new_context_with_model(model_llama, lcparams);
+    struct llama_context * ctx_llama = llama_init_from_model(model_llama, lcparams);
 
     // print some info about the processing
     {
@@ -391,6 +426,23 @@ int main(int argc, char ** argv) {
 
     prompt_llama = ::replace(prompt_llama, "{4}", chat_symb);
 
+    llama_batch batch = llama_batch_init(llama_n_ctx(ctx_llama), 0, 1);
+
+    // init sampler
+    auto sparams = llama_sampler_chain_default_params();
+
+    llama_sampler * smpl = llama_sampler_chain_init(sparams);
+
+    if (params.temp > 0.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(params.top_k));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(params.top_p, params.min_keep));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp (params.temp));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist (params.seed));
+        llama_sampler_chain_add(smpl, llama_sampler_init_min_p (params.min_p, params.min_keep));
+    } else {
+        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+    }
+
     // init session
     std::string path_session = params.path_session;
     std::vector<llama_token> session_tokens;
@@ -406,7 +458,7 @@ int main(int argc, char ** argv) {
 
             session_tokens.resize(llama_n_ctx(ctx_llama));
             size_t n_token_count_out = 0;
-            if (!llama_load_session_file(ctx_llama, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
+            if (!llama_state_load_file(ctx_llama, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
                 fprintf(stderr, "%s: error: failed to load session file '%s'\n", __func__, path_session.c_str());
                 return 1;
             }
@@ -426,8 +478,21 @@ int main(int argc, char ** argv) {
     printf("\n");
     printf("%s : initializing - please wait ...\n", __func__);
 
-    if (llama_eval(ctx_llama, embd_inp.data(), embd_inp.size(), 0)) {
-        fprintf(stderr, "%s : failed to eval\n", __func__);
+    // prepare batch
+    {
+        batch.n_tokens = embd_inp.size();
+
+        for (int i = 0; i < batch.n_tokens; i++) {
+            batch.token[i]     = embd_inp[i];
+            batch.pos[i]       = i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = i == batch.n_tokens - 1;
+        }
+    }
+
+    if (llama_decode(ctx_llama, batch)) {
+        fprintf(stderr, "%s : failed to decode\n", __func__);
         return 1;
     }
 
@@ -565,7 +630,7 @@ int main(int argc, char ** argv) {
                 }
 
                 // remove all characters, except for letters, numbers, punctuation and ':', '\'', '-', ' '
-                text_heard = std::regex_replace(text_heard, std::regex("[^a-zA-Z0-9\\.,\\?!\\s\\:\\'\\-]"), "");
+                text_heard = std::regex_replace(text_heard, std::regex("[^a-zA-Z0-9åäöÅÄÖ\\.,\\?!\\s\\:\\'\\-]"), "");
 
                 // take first line
                 text_heard = text_heard.substr(0, text_heard.find_first_of('\n'));
@@ -647,8 +712,21 @@ int main(int argc, char ** argv) {
                             n_session_consumed = session_tokens.size();
                         }
 
-                        if (llama_eval(ctx_llama, embd.data(), embd.size(), n_past)) {
-                            fprintf(stderr, "%s : failed to eval\n", __func__);
+                        // prepare batch
+                        {
+                            batch.n_tokens = embd.size();
+
+                            for (int i = 0; i < batch.n_tokens; i++) {
+                                batch.token[i]     = embd[i];
+                                batch.pos[i]       = n_past + i;
+                                batch.n_seq_id[i]  = 1;
+                                batch.seq_id[i][0] = 0;
+                                batch.logits[i]    = i == batch.n_tokens - 1;
+                            }
+                        }
+
+                        if (llama_decode(ctx_llama, batch)) {
+                            fprintf(stderr, "%s : failed to decode\n", __func__);
                             return 1;
                         }
                     }
@@ -663,56 +741,15 @@ int main(int argc, char ** argv) {
 
                     {
                         // out of user input, sample next token
-                        const float top_k          = 5;
-                        const float top_p          = 0.80f;
-                        const float temp           = 0.30f;
-                        const float repeat_penalty = 1.1764f;
-
-                        const int repeat_last_n    = 256;
 
                         if (!path_session.empty() && need_to_save_session) {
                             need_to_save_session = false;
-                            llama_save_session_file(ctx_llama, path_session.c_str(), session_tokens.data(), session_tokens.size());
+                            llama_state_save_file(ctx_llama, path_session.c_str(), session_tokens.data(), session_tokens.size());
                         }
 
-                        llama_token id = 0;
+                        const llama_token id = llama_sampler_sample(smpl, ctx_llama, -1);
 
-                        {
-                            auto logits = llama_get_logits(ctx_llama);
-                            auto n_vocab = llama_n_vocab(model_llama);
-
-                            logits[llama_token_eos(model_llama)] = 0;
-
-                            std::vector<llama_token_data> candidates;
-                            candidates.reserve(n_vocab);
-                            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                                candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
-                            }
-
-                            llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
-
-                            // apply repeat penalty
-                            const float nl_logit = logits[llama_token_nl(model_llama)];
-
-                            llama_sample_repetition_penalties(ctx_llama, &candidates_p,
-                                    embd_inp.data() + std::max(0, n_past - repeat_last_n),
-                                    repeat_last_n, repeat_penalty, 0.0, 0.0f);
-
-                            logits[llama_token_nl(model_llama)] = nl_logit;
-
-                            if (temp <= 0) {
-                                // Greedy sampling
-                                id = llama_sample_token_greedy(ctx_llama, &candidates_p);
-                            } else {
-                                // Temperature sampling
-                                llama_sample_top_k(ctx_llama, &candidates_p, top_k, 1);
-                                llama_sample_top_p(ctx_llama, &candidates_p, top_p, 1);
-                                llama_sample_temp (ctx_llama, &candidates_p, temp);
-                                id = llama_sample_token(ctx_llama, &candidates_p);
-                            }
-                        }
-
-                        if (id != llama_token_eos(model_llama)) {
+                        if (id != llama_vocab_eos(vocab_llama)) {
                             // add it to the context
                             embd.push_back(id);
 
@@ -760,8 +797,14 @@ int main(int argc, char ** argv) {
     whisper_print_timings(ctx_wsp);
     whisper_free(ctx_wsp);
 
-    llama_print_timings(ctx_llama);
+    llama_perf_sampler_print(smpl);
+    llama_perf_context_print(ctx_llama);
+
+    llama_sampler_free(smpl);
+    llama_batch_free(batch);
     llama_free(ctx_llama);
+
+    llama_backend_free();
 
     return 0;
 }
