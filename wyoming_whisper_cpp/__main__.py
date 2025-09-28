@@ -140,7 +140,7 @@ async def main() -> None:
         optional_args.extend(shlex.split(args.whisper_cpp_args))
 
     model_args = [
-        str(args.whisper_cpp_dir / "main"),
+        str(args.whisper_cpp_dir / "build" / "bin" / "whisper-cli"),
         "--model",
         str(model_path),
         "--language",

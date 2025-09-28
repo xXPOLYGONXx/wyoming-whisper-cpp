@@ -3,28 +3,24 @@ import subprocess
 from pathlib import Path
 from typing import Union
 
+# Find current models here: https://github.com/ggml-org/whisper.cpp/tree/master/models#available-models
 WHISPER_CPP_MODELS = [
     "tiny",
     "tiny.en",
-    "tiny-q5_1",
-    "tiny.en-q5_1",
     "base",
     "base.en",
-    "base-q5_1",
-    "base.en-q5_1",
     "small",
     "small.en",
-    "small-q5_1",
-    "small.en-q5_1",
+    "small.en-tdrz",
     "medium",
     "medium.en",
-    "medium-q5_0",
-    "medium.en-q5_0",
     "large-v1",
     "large-v2",
     "large-v2-q5_0",
     "large-v3",
     "large-v3-q5_0",
+    "large-v3-turbo",
+    "large-v3-turbo-q5_0"
 ]
 
 
