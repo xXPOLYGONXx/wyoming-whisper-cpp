@@ -6,7 +6,6 @@ import shlex
 from functools import partial
 from pathlib import Path
 from typing import Optional
-
 from wyoming.info import AsrModel, AsrProgram, Attribution, Info
 from wyoming.server import AsyncServer
 
@@ -53,7 +52,13 @@ async def main() -> None:
         default=5,
     )
     parser.add_argument(
-        "--audio-context-base", type=int, default=300, help="Base length of audio_ctx"
+        "--audio-ctx", type=int, default=300, help="Base length of audio_ctx"
+    )
+    parser.add_argument(
+        "--whisper-cpp-port",
+        type=int,
+        default=10301,
+        help="Change the Port of the internally running whisper-cpp server"
     )
     parser.add_argument(
         "--whisper-cpp-args",
@@ -135,18 +140,22 @@ async def main() -> None:
     server = AsyncServer.from_uri(args.uri)
     _LOGGER.info("Ready")
 
-    optional_args = ["--audio-context-base", str(args.audio_context_base)]
+    optional_args = ["--audio-ctx", str(args.audio_ctx)]
     if args.whisper_cpp_args:
         optional_args.extend(shlex.split(args.whisper_cpp_args))
 
     model_args = [
-        str(args.whisper_cpp_dir / "main"),
+        str(args.whisper_cpp_dir / "build" / "bin" / "whisper-server"),
         "--model",
         str(model_path),
         "--language",
         str(args.language),
         "--beam-size",
         str(args.beam_size),
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(args.whisper_cpp_port),
         *optional_args,
     ]
 
@@ -161,15 +170,22 @@ async def main() -> None:
 
     model_proc_lock = asyncio.Lock()
 
-    await server.run(
-        partial(
-            WhisperCppEventHandler,
-            wyoming_info,
-            args,
-            model_proc,
-            model_proc_lock,
+    try:
+        await server.run(
+            partial(
+                WhisperCppEventHandler,
+                wyoming_info,
+                args,
+                model_proc_lock,
+            )
         )
-    )
+    finally:
+        # Ensure whisper-server is terminated
+        if model_proc.returncode is None:
+            _LOGGER.info("Terminating whisper-server process...")
+            model_proc.terminate()
+            await model_proc.wait()
+            _LOGGER.info("Whisper-server process terminated.")
 
 
 # -----------------------------------------------------------------------------
