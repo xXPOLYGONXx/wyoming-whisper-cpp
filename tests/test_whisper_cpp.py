@@ -103,8 +103,6 @@ async def test_whisper_cpp(language: str) -> None:
         text = transcript.text.lower().strip()
         text = re.sub(r"[.!?]", "", text)
         # Remove all special characters from text to make test less flaky
-        print(text)
-        print(_TEST_PHRASE[language])
         assert text == _TEST_PHRASE[language]
         break
 
