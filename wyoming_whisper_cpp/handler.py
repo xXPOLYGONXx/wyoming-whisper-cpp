@@ -1,12 +1,13 @@
 """Event handler for clients of the server."""
 import argparse
 import asyncio
-import io
 import json
 import logging
+import os
+import requests
+import tempfile
 import wave
-from asyncio.subprocess import Process
-
+from typing import Optional
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioChunkConverter, AudioStop
 from wyoming.event import Event
@@ -15,7 +16,6 @@ from wyoming.server import AsyncEventHandler
 
 _LOGGER = logging.getLogger(__name__)
 
-
 class WhisperCppEventHandler(AsyncEventHandler):
     """Event handler for clients."""
 
@@ -23,7 +23,6 @@ class WhisperCppEventHandler(AsyncEventHandler):
         self,
         wyoming_info: Info,
         cli_args: argparse.Namespace,
-        model_proc: Process,
         model_proc_lock: asyncio.Lock,
         *args,
         **kwargs,
@@ -32,8 +31,10 @@ class WhisperCppEventHandler(AsyncEventHandler):
 
         self.cli_args = cli_args
         self.wyoming_info_event = wyoming_info.event()
-        self.model_proc = model_proc
         self.model_proc_lock = model_proc_lock
+        self._wav_dir = tempfile.TemporaryDirectory()
+        self._wav_path = os.path.join(self._wav_dir.name, "speech.wav")
+        self._wav_file: Optional[wave.Wave_write] = None
         self.audio = bytes()
         self.audio_converter = AudioChunkConverter(
             rate=16000,
@@ -46,50 +47,35 @@ class WhisperCppEventHandler(AsyncEventHandler):
         if AudioChunk.is_type(event.type):
             if not self.audio:
                 _LOGGER.debug("Receiving audio")
-
             chunk = AudioChunk.from_event(event)
-            chunk = self.audio_converter.convert(chunk)
-            self.audio += chunk.audio
 
+            if self._wav_file is None:
+                self._wav_file = wave.open(self._wav_path, "wb")
+                self._wav_file.setframerate(chunk.rate)
+                self._wav_file.setsampwidth(chunk.width)
+                self._wav_file.setnchannels(chunk.channels)
+
+            self._wav_file.writeframes(chunk.audio)
             return True
 
         if AudioStop.is_type(event.type):
-            _LOGGER.debug("Audio stopped")
+            _LOGGER.debug("Audio stopped. Transcribing...")
+            assert self._wav_file is not None
+
+            self._wav_file.close()
+            self._wav_file = None
+
             text = ""
-            with io.BytesIO() as wav_io:
-                wav_file: wave.Wave_write = wave.open(wav_io, "wb")
-                with wav_file:
-                    wav_file.setframerate(16000)
-                    wav_file.setsampwidth(2)
-                    wav_file.setnchannels(1)
-                    wav_file.writeframes(self.audio)
+            async with self.model_proc_lock:
+                with open(self._wav_path, "rb") as f:
+                    files = {
+                        "file": ("speech.wav", f, "application/octet-stream")
+                    }
+                    transcription = requests.post("http://127.0.0.1:10301/inference", files=files)
 
-                wav_io.seek(0)
-                wav_bytes = wav_io.getvalue()
-
-                assert self.model_proc.stdin is not None
-                assert self.model_proc.stdout is not None
-
-                async with self.model_proc_lock:
-                    request_str = json.dumps(
-                        {"size": len(wav_bytes), "language": self._language}
-                    )
-                    request_line = f"{request_str}\n".encode("utf-8")
-                    self.model_proc.stdin.write(request_line)
-                    self.model_proc.stdin.write(wav_bytes)
-                    await self.model_proc.stdin.drain()
-
-                    lines = []
-                    line = (await self.model_proc.stdout.readline()).decode().strip()
-                    while line != "<|endoftext|>":
-                        if line:
-                            lines.append(line)
-                        line = (
-                            (await self.model_proc.stdout.readline()).decode().strip()
-                        )
-
-                text = " ".join(lines)
-                text = text.replace("[BLANK_AUDIO]", "").strip()
+                    _LOGGER.debug(transcription)
+                    data = json.loads(transcription.text)
+                    text = data["text"].rstrip("\n").strip()
 
             _LOGGER.info(text)
 
@@ -101,7 +87,7 @@ class WhisperCppEventHandler(AsyncEventHandler):
             self._language = self.cli_args.language
 
             return False
-
+        
         if Transcribe.is_type(event.type):
             transcribe = Transcribe.from_event(event)
             if transcribe.language:

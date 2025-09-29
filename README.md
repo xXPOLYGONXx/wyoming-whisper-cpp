@@ -24,7 +24,7 @@ cd wyoming-whisper-cpp
 script/setup
 ```
 
-Build the whisper.cpp `whisper-cli` executable:
+Build the whisper.cpp `whisper-server` executable:
 
 ```sh
 cmake -S whisper.cpp -B whisper.cpp/build

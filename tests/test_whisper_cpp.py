@@ -5,6 +5,7 @@ import sys
 import wave
 from asyncio.subprocess import PIPE
 from pathlib import Path
+from time import sleep
 
 import pytest
 from wyoming.asr import Transcribe, Transcript
@@ -15,11 +16,11 @@ from wyoming.info import Describe, Info
 _DIR = Path(__file__).parent
 _PROGRAM_DIR = _DIR.parent
 _LOCAL_DIR = _PROGRAM_DIR / "local"
-_MODEL = "tiny-q5_1"
+_MODEL = "small"
 _SAMPLES_PER_CHUNK = 1024
 
 # Need to give time for the model to download
-_TRANSCRIBE_TIMEOUT = 60
+_TRANSCRIBE_TIMEOUT = 10
 
 _TEST_PHRASE = {
     "en": "turn on the living room lamp",
@@ -44,12 +45,14 @@ async def test_whisper_cpp(language: str) -> None:
         "--data-dir",
         str(_LOCAL_DIR),
         "--language",
-        "en",
+        language,
+        "--debug",
         stdin=PIPE,
         stdout=PIPE,
     )
     assert proc.stdin is not None
     assert proc.stdout is not None
+    sleep(3)
 
     # Check info
     await async_write_event(Describe().event(), proc.stdin)
