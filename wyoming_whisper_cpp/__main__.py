@@ -6,7 +6,6 @@ import shlex
 from functools import partial
 from pathlib import Path
 from typing import Optional
-
 from wyoming.info import AsrModel, AsrProgram, Attribution, Info
 from wyoming.server import AsyncServer
 
@@ -171,15 +170,22 @@ async def main() -> None:
 
     model_proc_lock = asyncio.Lock()
 
-    await server.run(
-        partial(
-            WhisperCppEventHandler,
-            wyoming_info,
-            args,
-            model_proc,
-            model_proc_lock,
+    try:
+        await server.run(
+            partial(
+                WhisperCppEventHandler,
+                wyoming_info,
+                args,
+                model_proc_lock,
+            )
         )
-    )
+    finally:
+        # Ensure whisper-server is terminated
+        if model_proc.returncode is None:
+            _LOGGER.info("Terminating whisper-server process...")
+            model_proc.terminate()
+            await model_proc.wait()
+            _LOGGER.info("Whisper-server process terminated.")
 
 
 # -----------------------------------------------------------------------------

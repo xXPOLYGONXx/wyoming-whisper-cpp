@@ -73,7 +73,7 @@ class WhisperCppEventHandler(AsyncEventHandler):
                     }
                     transcription = requests.post("http://127.0.0.1:10301/inference", files=files)
 
-                    _LOGGER.debug(transcription)
+                    _LOGGER.debug("Request to whisper.cpp returned code: %s, with Text: %s", transcription.status_code, transcription.text)
                     data = json.loads(transcription.text)
                     text = data["text"].rstrip("\n").strip()
 
